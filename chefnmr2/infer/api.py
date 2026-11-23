@@ -241,7 +241,7 @@ class ReconPool:
     * `atom_features_to_smiles` BLOCKS until every sample is done, which puts CPU reconstruction
       on the critical path between two GPU sampling runs. Submitting instead of blocking overlaps
       (N-1)/N of the reconstruction with sampling.
-    * Workers are forked at construction, BEFORE any CUDA context exists.
+    * Spawned workers do not inherit the model's threads or CUDA context.
 
     The worker function is the package's own `atom_features_to_smiles_one`, so reconstruction is
     bit-identical to the in-line path — this is a scheduling change, not a semantic one.
@@ -252,22 +252,20 @@ class ReconPool:
         from concurrent.futures import ProcessPoolExecutor
 
         self.num_workers = num_workers or _default_workers()
-        # "fork" explicitly, not the platform default: forking inherits the parent's
-        # already-imported modules, which is why workers start instantly.
         self._pool = ProcessPoolExecutor(
             max_workers=self.num_workers,
-            mp_context=multiprocessing.get_context("fork"),
+            mp_context=multiprocessing.get_context("spawn"),
             initializer=_recon_worker_init,
+            initargs=(os.getpid(),),
         )
-        # Force ALL the forks now, before the caller puts anything on the GPU.
-        # ProcessPoolExecutor spawns lazily and `_adjust_process_count` starts at most ONE
-        # worker per submit, and only when no worker is idle — so a single warm-up task would
-        # leave the other N-1 to fork mid-request, next to a live CUDA context. Submitting N
-        # briefly-blocking tasks keeps every worker busy while the next submit lands, which is
-        # what actually drives the count to max_workers.
-        from concurrent.futures import wait
-
-        wait([self._pool.submit(_recon_worker_warm) for _ in range(self.num_workers)])
+        # A successful constructor means reconstruction workers have initialized.
+        try:
+            futures = [self._pool.submit(_recon_worker_warm) for _ in range(self.num_workers)]
+            for future in futures:
+                future.result()
+        except BaseException:
+            self.shutdown()
+            raise
 
     def submit(self, coords, one_hot, mask, da) -> list:
         """coords (K, N, 3); one_hot (N, D); mask (N,). Returns K futures, in sample order."""
@@ -302,12 +300,25 @@ class ReconPool:
         return smiles, largest, status
 
     def shutdown(self):
-        self._pool.shutdown(wait=False, cancel_futures=True)
+        self._pool.shutdown(wait=True, cancel_futures=True)
 
 
-def _recon_worker_init():
-    """Match `atom_features_to_smiles`'s log suppression. The in-line path calls this in the parent
-    before forking; a persistent pool forks first, so the children have to do it themselves."""
+def _recon_worker_init(parent_pid):
+    """Keep Linux reconstruction children within the creating thread's lifetime."""
+    import ctypes
+    import signal
+    import sys
+
+    if sys.platform == "linux":
+        # The SDK's allocation thread stays alive until model cleanup. SIGKILL
+        # also covers forced model-process death, when no finally block can run.
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+        if os.getppid() != parent_pid:
+            os.kill(os.getpid(), signal.SIGKILL)
+
     from rdkit import RDLogger
 
     RDLogger.DisableLog("rdApp.*")
@@ -435,16 +446,13 @@ class ChefNMR2:
         """`members` is [(tag, model_pt, config_yaml), ...] in any order — sorted here by epoch.
 
         `device` is "cuda" or "cpu". `recon_workers=None` reconstructs structures in a pool of one
-        worker per CPU, built before any CUDA context; `recon_workers=0` reconstructs in the calling
+        worker per CPU; `recon_workers=0` reconstructs in the calling
         process, for hosted environments that do not allow a persistent pool.
         """
         if not members:
             raise ValueError("ChefNMR2 needs at least one member")
 
         self.recon_pool = None
-        if recon_workers != 0:
-            self.recon_pool = ReconPool(recon_workers)
-
         self.device = device
 
         recs = []
@@ -465,6 +473,10 @@ class ChefNMR2:
 
         self.tags = [r["tag"] for r in recs]
         self.epochs = [r["epoch"] for r in recs]
+        # Checkpoint loading and agreement checks can fail. Start children only
+        # after those steps, so a failed model load has no pool to retire.
+        if recon_workers != 0:
+            self.recon_pool = ReconPool(recon_workers)
 
     def _check_member_agreement(self):
         ref = self.members[0]
@@ -537,31 +549,16 @@ class ChefNMR2:
         # took: with the persistent pool most of it already happened while the GPU was on the
         # next member. `timing_s.total` is the number to compare across configurations.
         t1 = time.time()
-        drained = None
-        if self.recon_pool is not None:
-            try:
-                smiles, largest, status = [], [], []
-                for f in futures:
-                    s, l, e = ReconPool.drain(f)
-                    smiles += s
-                    largest += l
-                    status += e
-                drained = True
-            except Exception as e:  # BrokenProcessPool and friends
-                # A persistent pool that breaks stays broken, which would wedge every later
-                # call. Drop it permanently and reconstruct in-line (a fresh pool per call)
-                # instead; not rebuilt, since a new fork would now happen next to a live CUDA
-                # context. The process degrades in speed, not in correctness.
-                print(
-                    f"WARNING: reconstruction pool failed ({type(e).__name__}: {e}); "
-                    f"this process has dropped to the in-line reconstruction path"
-                )
-                try:
-                    self.recon_pool.shutdown()
-                except Exception:
-                    pass
-                self.recon_pool = None
-                drained = False
+        drained = self.recon_pool is not None
+        if drained:
+            # A failed pool remains owned until shutdown; propagate its error
+            # instead of silently creating an unrelated fallback pool.
+            smiles, largest, status = [], [], []
+            for f in futures:
+                s, l, e = ReconPool.drain(f)
+                smiles += s
+                largest += l
+                status += e
         if not drained:
             smiles, largest, _c, status = bond_analyzer.atom_features_to_smiles(
                 {
