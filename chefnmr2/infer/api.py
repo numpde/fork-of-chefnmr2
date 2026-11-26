@@ -377,12 +377,17 @@ def load_export(ckpt_path: str, cfg_path: str):
 class _Checkpoint:
     """One checkpoint, built once: its config, its model on `device`, its epoch and tag."""
 
-    def __init__(self, ckpt_path: str, cfg_path: str, device: str = "cuda", tag: str | None = None):
+    def __init__(
+        self, ckpt_path: str, cfg_path: str, device: str = "cuda", tag: str | None = None,
+        parameter_dtype: torch.dtype = torch.float32,
+    ):
         from chefnmr2.model.build import build_model
 
         cfg, state, epoch = load_export(ckpt_path, cfg_path)
         self.cfg = cfg
-        model = build_model(cfg)
+        # Cast on CPU before loading and moving to the accelerator, so reduced
+        # precision does not require a temporary FP32 allocation on the GPU.
+        model = build_model(cfg).to(dtype=parameter_dtype)
         model.load_state_dict(state, strict=True)
         del state
         self.model = model.eval().to(device)
@@ -442,8 +447,14 @@ class ChefNMR2:
     default `seed=0`), as in the paper's runs.
     """
 
-    def __init__(self, members: list, device: str = "cuda", recon_workers: int | None = None):
+    def __init__(
+        self, members: list, device: str = "cuda", recon_workers: int | None = None,
+        parameter_dtype: torch.dtype = torch.float32,
+    ):
         """`members` is [(tag, model_pt, config_yaml), ...] in any order — sorted here by epoch.
+
+        `parameter_dtype` controls floating-point parameters and buffers in every member;
+        checkpoint files and the CUDA BF16 autocast policy are unchanged.
 
         `device` is "cuda" or "cpu". `recon_workers=None` reconstructs structures in a pool of one
         worker per CPU; `recon_workers=0` reconstructs in the calling
@@ -457,7 +468,9 @@ class ChefNMR2:
 
         recs = []
         for tag, ckpt_path, cfg_path in members:
-            chef = _Checkpoint(ckpt_path=ckpt_path, cfg_path=cfg_path, device=device, tag=tag)
+            chef = _Checkpoint(
+                ckpt_path=ckpt_path, cfg_path=cfg_path, device=device, tag=tag, parameter_dtype=parameter_dtype,
+            )
             recs.append({"tag": tag, "epoch": chef.epoch, "cfg": chef.cfg, "chef": chef})
 
         # Ascending epoch is load-bearing for tie-breaking, not cosmetic (see the class
